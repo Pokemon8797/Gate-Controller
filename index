@@ -1,0 +1,878 @@
+# My Code
+
+```python
+from nicegui import ui, app
+from datetime import date, datetime, timedelta
+from dateutil import parser
+from dotenv import load_dotenv
+from pathlib import Path
+from dateutil.relativedelta import relativedelta
+import os
+import requests
+import asyncio
+import serial
+import serial.tools.list_ports
+import logging
+import json
+
+program_files = os.environ.get("ProgramFiles")
+
+logging.basicConfig(
+     filename=Path(os.getenv("APPDATA")) / "ArenaBadmintonGateController" / "logs.log",
+     encoding="utf-8",
+     filemode="a",
+     level = logging.DEBUG,
+     format="{asctime} - {levelname} - {message}",
+     style="{",
+     datefmt="%Y-%m-%d %H:%M",
+)
+
+# --- Layout: Center All Content in a Column ---
+with ui.row().classes('w-full h-screen items-center justify-center gap-24'):
+    
+    # LEFT COLUMN: Logo, Labels, Input
+    with ui.column().classes('items-center justify-center h-full px-24'):
+        # Company Logo
+        ui.image(Path(os.getenv("ProgramFiles")) / "Arena Badminton Gate Controller" / "_internal" / "logo.gif").style('width: 300px')
+
+        # Input Label and Field
+        ui.label("Welcome to Arena!").style('font-size: 3.0em; margin-top: 0px')
+        ui.label("Scan Barcode Below to Enter").style('font-size: 2.0em; margin-top: 0px')
+        barcode_input = ui.input(placeholder="e.g. 123456").classes('w-80 h-32 text-5xl').props('outlined')
+
+        # Result Text Output
+        result_text = ui.label("").style('font-size: 2.0em; margin-top: 0px')     # Access Granted
+        result_text2 = ui.label("").style('font-size: 2.0em; margin-top: 0px')    # Welcome First Last
+        status_text = ui.label("").style('font-size: 2.0em; margin-top: 0px')     # Status
+        membership_text = ui.label("").style('font-size: 2.0em; margin-top: 0px') # Membership
+
+    # RIGHT COLUMN: Photo
+    with ui.column().classes('items-center justify-center h-full'):
+        Photo = ui.image('https://via.placeholder.com/150').style('width: 500px; margin-top: 0px')
+
+
+# Global serial port object
+arduino = None
+
+# global or outer variable to store the timer task
+timer_task = None  
+
+
+async def timer_function():
+    try:
+        await asyncio.sleep(5)  # your timer delay
+        clear_field() #clears all fields after timer elapsed
+        print("Timer finished")
+    except asyncio.CancelledError:
+        #if clear function is called before previous timer finishes cancel previous timer
+        print("Timer cancelled") 
+        raise
+
+def clear_field():
+    result_text.text = ""
+    result_text2.text = ""
+    result_text.style('color: black')
+    result_text2.style('color: black')
+    status_text.text = ""
+    membership_text.text = ""
+    status_text.style('color: black')
+    membership_text.style('color: black')
+    Photo.set_source("https://via.placeholder.com/150")
+
+def find_arduino_port():
+    ports = serial.tools.list_ports.comports()
+    for port in ports:
+        if (
+            "Numato" in port.description,
+            "Arduino" in port.description
+        ):
+            return port.device
+    return None
+
+
+# --- Open Arduino Serial at startup ---
+port = find_arduino_port()
+
+async def open_port():
+    global arduino
+    global port 
+
+    if port != None:
+            try:
+                arduino = serial.Serial(port, 19200)
+                print(f"Arduino Connected on {port}")
+                return arduino
+            except serial.SerialException as e:
+                print("Serial Exception Occured")
+                print(f"Error: {e}")
+                result_text.text = "Attenion Staff: Reconnect the Orange Relay and Restart the App"
+                result_text.style('color: red')
+                print("try again")
+                barcode_input.value = ""  # Clear field after processing
+                await asyncio.sleep(10)
+                result_text.text = ""
+                result_text.style('color: black')
+                print("return?")
+                logging.error('No Relay')
+                return arduino
+
+    elif port == None:
+        barcode_input.value = ""  # Clear field after processing
+        result_text.text = "Please Connect Relay and Restart App"
+        result_text.style('color: red')
+        await asyncio.sleep(3)
+        result_text.text = ""
+        result_text.style('color: black')
+        return
+
+app.on_startup(open_port())
+
+# --- Submission Logic ---
+async def process_barcode():
+    global arduino
+    global port
+    global timer_task
+
+    clear_field()
+
+    
+    # If timer_task exists and is running, cancel it
+    if timer_task and not timer_task.done():
+        timer_task.cancel()
+        try:
+            await timer_task  # wait for cancellation to propagate
+        except asyncio.CancelledError:
+            pass
+
+    relay_on_command = f"relay on {0}\r"
+    relay_off_command = f"relay off {0}\r"
+
+    # Example Client ID
+    client_id = barcode_input.value.strip()
+    print(f"Client ID: {client_id}")
+    logging.info('Client ID : %s', client_id)
+    env_path = Path(os.getenv("APPDATA")) / "ArenaBadmintonGateController" / ".env"
+    load_dotenv(dotenv_path=env_path)
+
+    #Get todays date
+    todays_date = date.today()
+
+    #The date 7 months ago
+    sma = todays_date - relativedelta(months=7)
+
+    #Get Key Expiration Date
+    Key_Date = os.getenv("env_KeyExp")
+    Key_EXP_Date = parser.isoparse(Key_Date)
+    TodaysDT = datetime.now(Key_EXP_Date.tzinfo)
+
+    # API Key andd Site ID
+    API_KEY = os.getenv("env_Key")
+    SITE_ID = os.getenv("env_SID")
+
+    print (f"Key Exp Date ENV: {Key_EXP_Date}")
+
+    # Base URL for Mindbody API v6
+    BASE_URL = "https://api.mindbodyonline.com/public/v6"
+
+    # Endpoint to access client information
+    ENDPOINT_add_Arrival = f"{BASE_URL}/client/addarrival"
+
+    #Add Arrival Param
+    params_Arrival = {
+        "ClientId": client_id,
+        "LocationId": 1,
+        "Test": True
+    }
+
+    def get_token():
+
+        # Headers Token
+        headers_Token = {
+            "Api-Key": API_KEY,
+            "SiteId": SITE_ID,
+        }
+
+        #Parameter Token
+        params_Token = {
+        "Username": os.getenv("env_User"),
+        "Password": os.getenv("env_Pass"),
+        }
+
+        ENDPOINT_Token = f"{BASE_URL}/usertoken/issue"
+
+        if TodaysDT > Key_EXP_Date:
+            # Get Token Auth
+            response_Token = requests.post(ENDPOINT_Token, headers=headers_Token, json=params_Token)
+
+            if response_Token.status_code == 200:
+
+                Token_Resp = response_Token.json()
+                AUTHORIZATION = Token_Resp.get("AccessToken")
+                Expiration = Token_Resp.get("Expires")
+
+                # Step 1: Read all lines
+                with open(env_path, "r") as file:
+                    lines = file.readlines()
+                    print("Before:", lines)
+
+                # Step 2: Remove the first line text if the file isn't empty
+                if lines:
+                    new_line = f"env_Auth={AUTHORIZATION}\n"
+                    lines[0] = new_line
+
+                # Step 3: Add your new line                        
+                with open(env_path, "w") as file:
+                    file.writelines(lines)
+
+                # Step 4: Remove the last line if the file isn't empty
+                if lines:
+                    lines[5] = f"env_KeyExp={Expiration}\n"
+
+                # Step 6: Write the updated lines back to the file
+                with open(env_path, "w") as file:
+                    file.writelines(lines)
+
+                return AUTHORIZATION
+            
+            else:
+
+                print("Error:", response_Token.status_code, response_Token.text)
+
+        else:
+
+            AUTHORIZATION =  os.getenv("env_Auth")
+            return AUTHORIZATION
+
+    Auth = get_token()
+
+    # Headers
+    headers = {
+        "Api-Key": API_KEY,
+        "SiteId": SITE_ID,
+        "Content-Type": "application/json",
+        # Optional Authorization header if you're using OAuth
+        "Authorization": Auth  
+    }
+
+
+
+    def check_photo():
+
+        #Client Info Paramters
+        params_Client_Info = {
+            "ClientId": client_id,
+            "RequiredClientData": "Memberships"
+        }
+
+        ENDPOINT_Client_Info = f"{BASE_URL}/client/clientcompleteinfo"
+        response_Client_Info = requests.get(ENDPOINT_Client_Info, headers=headers, params=params_Client_Info)
+
+        if response_Client_Info.status_code == 200:
+            Client_JSON = response_Client_Info.json()
+            # pretty_client = json.dumps(Client_JSON, indent=4)
+            # print(pretty_client)
+            Client_Data = Client_JSON['Client']
+            FirstN = Client_Data.get("FirstName")
+            LastN = Client_Data.get("LastName")
+            Photo_URL = Client_Data.get("PhotoUrl")
+            Waiver = Client_Data.get("LiabilityRelease")
+            Active = Client_Data.get("Active")
+
+            print(f"act? {Active}")  
+
+
+            if Active == False:
+                result_text.text = "Account Deactivated"
+                result_text.style('color: red')
+                accvalid = False
+                return None, None, None, None, None, accvalid, None
+            
+            elif Photo_URL:
+
+                Photo_Status = True
+                return Photo_Status, Photo_URL, FirstN, LastN, Client_JSON, None, Waiver
+ 
+                
+            else:
+
+                Photo_Status = False 
+                return Photo_Status, None, FirstN, LastN, None, None, Waiver
+             
+        else:
+
+            if "exist" in response_Client_Info.text:
+                print("Error:", response_Client_Info.status_code, response_Client_Info.text)
+                logging.error(response_Client_Info.text)
+                result_text.text = "No Account Found"
+                result_text.style('color: red')
+                accvalid = False
+                return None, None, None, None, None, accvalid, None
+            
+            else:
+                result_text.text = f"Error: {response_Client_Info.text}"
+                result_text.style('color: red')
+                logging.error(response_Client_Info.text)
+                print("Error:", response_Client_Info.status_code, response_Client_Info.text)
+                accvalid = False
+                return None, None, None, None, None, accvalid, None
+
+
+
+    def check_visit():
+
+        #Check Visit
+        params = {
+            "ClientId": client_id,
+            "StartDate": todays_date,
+            "Offset": 0
+        }
+
+        ENDPOINT_Visits = f"{BASE_URL}/client/clientvisits"
+        response_Visit = requests.get(ENDPOINT_Visits, headers=headers, params=params)
+
+        if response_Visit.status_code == 200:
+            Visit = response_Visit.json()
+            pagination = Visit.get("PaginationResponse")  # Or Visit_data["PaginationResponse"]
+
+            # Now access individual fields within it
+            check_Visit = pagination.get("TotalResults")
+            visited_today = False
+
+            if check_Visit != 0: # Checks if they came in already today
+
+                for Visit in Visit['Visits']:
+
+                    sname = Visit.get("Name")
+                    print(sname)
+
+                    if any(word in (sname or "").lower() for word in ["reservation", "court"]):
+                        dt3 = None
+                        continue
+                
+                    raw_date = Visit.get('StartDateTime')
+                    print(raw_date)
+                    dt = datetime.fromisoformat(raw_date)
+                    date_only = dt.date()
+
+                    if date_only == todays_date:
+
+                        visited_today = True
+                        dt3 = dt + timedelta(hours=3)
+                        break
+                        
+                return visited_today, dt3       
+                        
+            else:
+                visited_today = False
+                return visited_today, None
+
+
+
+    def check_daily_passes():
+        counter = 0
+        purchase_params = {
+        "ClientId": client_id,
+        "Limit": 1000,
+        "Offset": 0,
+        "StartDate": sma
+    }
+
+        ENDPOINT_Purchases = f"{BASE_URL}/client/clientpurchases"
+        response_Purchases = requests.get(ENDPOINT_Purchases, headers=headers, params=purchase_params)
+
+        if response_Purchases.status_code == 200:
+
+            purchase_Data = response_Purchases.json()
+            # pretty_data = json.dumps(purchase_Data, indent=4)
+            # print(pretty_data)
+            daily_pass_status = False
+            Six_M_Pass = False
+            Six_M_exp = None
+            Free_M_Pass = False
+            Parent_Pass = False
+            Free_M_exp = None
+            expiredtf = None
+            cid = None
+
+            for purchase in purchase_Data["Purchases"]:
+
+                sale_info = purchase.get("Sale", {})
+                sale_date_raw = sale_info.get("SaleDate")
+                purchase_desc = purchase.get("Description", "").lower()
+                pitem = sale_info.get("PurchasedItems", [])
+                raw_price = purchase.get("Price")
+                
+
+                # Check each item in the purchase
+                for item in pitem:
+                    exp_date_raw = item.get("ExpDate")
+                    print(f"name:{purchase_desc}")
+
+                    # Check for 6-month pass (regardless of sale date)
+                    if "6 months" in purchase_desc and exp_date_raw:
+                        Six_M_exp = parser.isoparse(exp_date_raw).date()
+                        if Six_M_exp >= todays_date:
+                            print("Not expired")
+                            Six_M_Pass = True
+                            expiredtf = False
+                        else:
+                            print("expired")
+                            expiredtf = True
+
+                    if "no charge" in purchase_desc and exp_date_raw:
+                        Free_M_exp = parser.isoparse(exp_date_raw).date()
+                        if Free_M_exp >= todays_date:
+                            Free_M_Pass = True
+                            expiredtf == False
+                        else:
+                            expiredtf = True
+
+                    if "parent" in purchase_desc and exp_date_raw:
+                        Free_M_exp = parser.isoparse(exp_date_raw).date()
+                        if Free_M_exp >= todays_date:
+                            Parent_Pass = True
+                            expiredtf == False
+                        else:
+                            expiredtf = True                            
+
+                    if "10 times" in purchase_desc and exp_date_raw:
+                        Ten_passe_exp = parser.isoparse(exp_date_raw).date()
+                        if Ten_passe_exp >= todays_date:
+                            expiredtf = False
+                        elif Ten_passe_exp <= todays_date:
+                            expiredtf = True
+
+                # Check for daily pass (only if purchased today)
+                if sale_date_raw:
+                    sale_date = parser.isoparse(sale_date_raw).date()
+                    if sale_date == todays_date:
+                        if purchase_desc == "junior trainee day pass":
+                             daily_pass_status = True 
+                             tic_amt0 = raw_price/6
+                             counter += tic_amt0
+
+                        if purchase_desc == "2024 one day pass":
+                             daily_pass_status = True                        
+                             tic_amt1 = raw_price/15
+                             counter += tic_amt1
+                        
+                        if purchase_desc == "2024 one day pass jr":
+                             daily_pass_status = True 
+                             tic_amt2 = raw_price/12
+                             counter += tic_amt2
+
+                        if purchase_desc == "morning adult 11(9am - 12pm only)":
+                             daily_pass_status = True 
+                             tic_amt3 = raw_price/11
+                             counter += tic_amt3
+                             cid = -48                              
+
+                        if purchase_desc == "morning junior $9 (9am - 12pm only)":
+                             daily_pass_status = True 
+                             tic_amt4 = raw_price/9
+                             counter += tic_amt4
+                             cid = -48  
+
+            return  daily_pass_status, Six_M_Pass, Six_M_exp, Free_M_Pass, Parent_Pass, Free_M_exp, expiredtf, counter, cid       
+       
+            
+    def check_membership(Client_JSON):
+
+        cdata = Client_JSON['ClientMemberships']
+
+        if cdata:
+            for check_memb in Client_JSON['ClientMemberships']:
+                membership = check_memb.get("Name")
+                print(f"m_name: {membership}")
+                membership_exp = check_memb.get("ExpirationDate")
+                membership_Remain = check_memb.get("Remaining")
+                membership_current = check_memb.get("Current")
+                print(f"cm: {membership_current}")
+                print(f"fremain: {membership_Remain}")
+
+                if any(word in membership.lower() for word in ["coach membership, no charge"]): #Checks if they have purchased the corresponding passes                                 
+                    
+                    pass_type = "Coach"
+                    return pass_type, membership, membership_exp, membership_Remain, None
+                
+                elif "morning adult 10 day" in membership.lower(): #Checks if they have purchased the corresponding passes
+                    if membership_Remain > 0:
+                        if membership_current == True: 
+                            pass_type = "morning adult 10 times pass"
+                            exptf2 = False
+                            return pass_type, membership, membership_exp, membership_Remain, exptf2
+                        
+                elif "morning junior 10 day" in membership.lower(): #Checks if they have purchased the corresponding passes
+                    if membership_Remain > 0:
+                        if membership_current == True: 
+                            pass_type = "morning junior 10 times pass"
+                            exptf2 = False
+                            return pass_type, membership, membership_exp, membership_Remain, exptf2                        
+                                       
+                elif "10 day" in membership.lower(): #Checks if they have purchased the corresponding passes
+                    if membership_Remain > 0:
+                        if membership_current == True: 
+                            pass_type = "10 Times"
+                            exptf2 = False
+                            return pass_type, membership, membership_exp, membership_Remain, exptf2
+                        
+                elif "junior training pass" in membership.lower(): #Checks if they have purchased the corresponding passes
+                    if membership_Remain > 0:
+                        if membership_current == True: 
+                            pass_type = "15 Times JR Training"
+                            exptf2 = False
+                            return pass_type, membership, membership_exp, membership_Remain, exptf2                       
+
+            else:
+
+                print("Valid Pass Not Foud. Please Purchase at Front Desk 1")
+                logging.info('Valid Pass Not Foud. Please Purchase at Front Desk 1')
+                return "None", None, None, None, None
+        else:
+
+                print("Valid Pass Not Foud. Please Purchase at Front Desk 2")
+                logging.info('Valid Pass Not Foud. Please Purchase at Front Desk 2')
+                return "None", None, None, None, None
+    
+
+    
+    Picture_Status, photo, firstN, LastN, cjson, accvalid, lw = check_photo()
+
+    print(f"Arduino: {port}")
+
+    if accvalid == False:
+        print("clearing field after no account")
+        barcode_input.value = ""  # Clear field after processing
+        timer_task = asyncio.create_task(timer_function())
+        
+
+    elif Picture_Status == False:
+
+        result_text.text = "❌ Access Denied"
+        result_text2.text = f"{firstN} {LastN}, Please Take Picture at Front Desk"
+        logging.info('No Picture')
+        result_text.style('color: red')
+        result_text2.style('color: red')
+
+    elif lw == False:
+
+        result_text.text = "❌ Access Denied"
+        result_text2.text = f"{firstN} {LastN}, Please Sign Waiver at Front Desk"
+        logging.info('No Waiver')
+        result_text.style('color: red')
+        result_text2.style('color: red')
+
+
+    elif Picture_Status == True:
+        
+        daily_pass_tf, six_m_pass, six_m_exp, free_m_pass, parent_pass, free_m_exp, exptf, count, Cid  = check_daily_passes()
+        print(f"DPTF: {daily_pass_tf}")
+        print(f"counter jr:{count}")
+        
+        if free_m_pass == True:
+
+            arduino.write(relay_on_command.encode())
+            await asyncio.sleep(0.5)
+            arduino.write(relay_off_command.encode())
+
+            result_text.text = "✅ Access Granted"
+            result_text2.text = f"Welcome, {firstN} {LastN}"
+            status_text.text = "Pass Type: Free Membership Coach"
+            membership_text.text = f"Expiration: {free_m_exp}"
+            Photo.set_source(photo)
+            
+
+            response_add_Arrival = requests.post(ENDPOINT_add_Arrival, headers=headers, json=params_Arrival)
+
+            if response_add_Arrival.status_code == 200:
+                
+                print("visit Added")
+
+            else:
+
+                print("Error:", response_add_Arrival.status_code, response_add_Arrival.text)
+
+        elif parent_pass == True:
+
+            arduino.write(relay_on_command.encode())
+            await asyncio.sleep(0.5)
+            arduino.write(relay_off_command.encode())
+
+            result_text.text = "✅ Access Granted"
+            result_text2.text = f"Welcome, {firstN} {LastN}"
+            status_text.text = "Pass Type: Free Membership Parent"
+            membership_text.text = f"Expiration: {free_m_exp}"
+            Photo.set_source(photo)
+            
+            response_add_Arrival = requests.post(ENDPOINT_add_Arrival, headers=headers, json=params_Arrival)
+
+            if response_add_Arrival.status_code == 200:
+                
+                print("visit Added")
+
+            else:
+
+                print("Error:", response_add_Arrival.status_code, response_add_Arrival.text)
+        
+        elif free_m_pass == False:
+
+            visit_tf, dt3 = check_visit()
+            now = datetime.now()
+ 
+            if visit_tf == True and now<dt3:
+                
+                time_str = dt3.strftime("%I:%M %p")
+                arduino.write(relay_on_command.encode())
+                await asyncio.sleep(0.5)
+                arduino.write(relay_off_command.encode())
+
+                result_text.text = "✅ Access Granted"
+                result_text2.text = f"Welcome Back, {firstN} {LastN}"
+                status_text.text = f"Re-Entry Time Limit: {time_str}"
+                Photo.set_source(photo)
+
+            elif visit_tf == True and now>dt3:
+
+                result_text.text = f"{firstN} {LastN} Already Came. Ask Front Desk for Re-Entry"
+
+            elif six_m_pass == True:
+
+                arduino.write(relay_on_command.encode())
+                await asyncio.sleep(0.5)
+                arduino.write(relay_off_command.encode())
+
+                response_add_Arrival = requests.post(ENDPOINT_add_Arrival, headers=headers, json=params_Arrival)
+
+                if response_add_Arrival.status_code == 200:
+                    
+                    print("visit Added")
+
+                else:
+
+                    print("Error:", response_add_Arrival.status_code, response_add_Arrival.text)
+
+                result_text.text = "✅ Access Granted"
+                result_text2.text = f"Welcome, {firstN} {LastN}"
+                status_text.text = "Pass Type: 6 Months Junior Training Pass" 
+                membership_text.text = f"Expiration: {six_m_exp}"  
+                Photo.set_source(photo)
+
+
+            elif daily_pass_tf == True:
+                
+                result_text.text = "✅ Access Granted"
+                result_text2.text = f"Welcome, {firstN} {LastN}"
+                status_text.text = "Pass Type: Daily Pass" 
+                Photo.set_source(photo)
+
+                count = int(count)
+                
+                for _ in range(count):
+                    arduino.write(relay_on_command.encode())
+                    await asyncio.sleep(0.62)  # Simulate button press duration
+                    arduino.write(relay_off_command.encode())
+                    await asyncio.sleep(0.62)  # Pause between presses
+
+                if Cid == -48:
+                    
+                    params_Arrival2 = {
+                        "ClientId": client_id,
+                        "LocationId": 1,
+                        "ArrivalTypeId":48,
+                        "Test": True,
+                    }
+
+                    response_add_Arrival = requests.post(ENDPOINT_add_Arrival, headers=headers, json=params_Arrival2)
+
+                    if response_add_Arrival.status_code == 200:
+                        
+                        print("visit Added")
+
+                    else:
+
+                        print("Error:", response_add_Arrival.status_code, response_add_Arrival.text)
+
+                else:
+                    
+                    response_add_Arrival = requests.post(ENDPOINT_add_Arrival, headers=headers, json=params_Arrival)
+
+                    if response_add_Arrival.status_code == 200:
+                        
+                        print("visit Added")
+
+                    else:
+
+                        print("Error:", response_add_Arrival.status_code, response_add_Arrival.text)
+
+            elif daily_pass_tf == False:
+                
+
+                m_stat, m_name, expdt, remaining, expired = check_membership(cjson)
+                
+                print(f"Pass Remain: {remaining}")
+
+                if m_stat != "None":
+                    expparse = parser.isoparse(expdt)
+                    expiso = expparse.date()
+                    exp = expiso.strftime("%m/%d/%Y")
+
+                if any(word in m_stat.lower() for word in ["coach"]):
+
+                    arduino.write(relay_on_command.encode())
+                    await asyncio.sleep(0.5)
+                    arduino.write(relay_off_command.encode())
+
+                    response_add_Arrival = requests.post(ENDPOINT_add_Arrival, headers=headers, json=params_Arrival)
+
+                    if response_add_Arrival.status_code == 200:
+                        
+                        print("visit Added")
+
+                    else:
+
+                        print("Error:", response_add_Arrival.status_code, response_add_Arrival.text)
+
+                    result_text.text = "✅ Access Granted"
+                    result_text2.text = f"Welcome, {firstN} {LastN}"
+                    status_text.text = f"Pass Type: {m_name}| Expiration: {exp}" 
+                    Photo.set_source(photo)
+
+                elif any(word in m_stat.lower() for word in ["morning adult 10 times pass"]):
+                    day_number = now.weekday()
+                    hour = now.hour
+                    if day_number < 5 and hour < 12:
+                        result_text.text = "✅ Access Granted"
+                        result_text2.text = f"Welcome, {firstN} {LastN}"
+                        status_text.text = f"Pass Type: {m_name}"
+                        membership_text.text = f"Remaining: {remaining - 1} | Expiration: {exp}" 
+                        Photo.set_source(photo)
+
+                        if expired == False and remaining > 0:
+                            arduino.write(relay_on_command.encode())
+                            await asyncio.sleep(0.5)
+                            arduino.write(relay_off_command.encode())
+
+                            response_add_Arrival = requests.post(ENDPOINT_add_Arrival, headers=headers, json=params_Arrival)
+                        
+                            if response_add_Arrival.status_code == 200:
+                                print("Visit added")
+            
+                            else:
+                                print("Error:", response_add_Arrival.status_code, response_add_Arrival.text)
+                                logging.warning(response_add_Arrival.text)
+                    else:
+                        result_text.text = "❌ Access Denied"
+                        result_text2.text = f"Your Pass Is Only Valid Before 12PM On A Weekday"
+                        result_text.style('color: red')
+                        result_text2.style('color: red')  
+
+                elif any(word in m_stat.lower() for word in ["morning junior 10 times pass"]):
+                    day_number = now.weekday()
+                    hour = now.hour
+                    if day_number < 5 and hour < 12:
+                        result_text.text = "✅ Access Granted"
+                        result_text2.text = f"Welcome, {firstN} {LastN}"
+                        status_text.text = f"Pass Type: {m_name}"
+                        membership_text.text = f"Remaining: {remaining - 1} | Expiration: {exp}" 
+                        Photo.set_source(photo)
+
+                        if expired == False and remaining > 0:
+                            arduino.write(relay_on_command.encode())
+                            await asyncio.sleep(0.5)
+                            arduino.write(relay_off_command.encode())
+
+                            response_add_Arrival = requests.post(ENDPOINT_add_Arrival, headers=headers, json=params_Arrival)
+                        
+                            if response_add_Arrival.status_code == 200:
+                                print("Visit added")
+            
+                            
+                            else:
+                                print("Error:", response_add_Arrival.status_code, response_add_Arrival.text)
+                                logging.warning(response_add_Arrival.text)
+                    else:
+                        result_text.text = "❌ Access Denied"
+                        result_text2.text = f"Your Pass Is Only Valid Before 12PM On A Weekday"    
+                        result_text.style('color: red')
+                        result_text2.style('color: red')  
+
+                elif any(word in m_stat.lower() for word in ["10 times"]):
+                    
+                    result_text.text = "✅ Access Granted"
+                    result_text2.text = f"Welcome, {firstN} {LastN}"
+                    status_text.text = f"Pass Type: {m_name}"
+                    membership_text.text = f"Remaining: {remaining - 1} | Expiration: {exp}" 
+                    Photo.set_source(photo)
+
+                    if expired == False and remaining > 0:
+                        arduino.write(relay_on_command.encode())
+                        await asyncio.sleep(0.5)
+                        arduino.write(relay_off_command.encode())
+
+                        response_add_Arrival = requests.post(ENDPOINT_add_Arrival, headers=headers, json=params_Arrival)
+                    
+                        if response_add_Arrival.status_code == 200:
+                            print("Visit added")
+        
+                        
+                        else:
+                            print("Error:", response_add_Arrival.status_code, response_add_Arrival.text)
+                            logging.warning(response_add_Arrival.text)
+
+                elif any(word in m_stat.lower() for word in ["15 times"]):
+                    
+                    result_text.text = "✅ Access Granted"
+                    result_text2.text = f"Welcome, {firstN} {LastN}"
+                    status_text.text = f"Pass Type: {m_name}"
+                    membership_text.text = f"Remaining: {remaining - 1} | Expiration: {exp}" 
+                    Photo.set_source(photo)
+
+                    if expired == False and remaining > 0:
+                        arduino.write(relay_on_command.encode())
+                        await asyncio.sleep(0.5)
+                        arduino.write(relay_off_command.encode())
+
+                        response_add_Arrival = requests.post(ENDPOINT_add_Arrival, headers=headers, json=params_Arrival)
+                    
+                        if response_add_Arrival.status_code == 200:
+                            print("Visit added")
+                        
+                        else:
+                            print("Error:", response_add_Arrival.status_code, response_add_Arrival.text)
+                            logging.warning(response_add_Arrival.text)
+
+                elif exptf == True:
+
+                    result_text.text = "❌ Access Denied"
+                    result_text2.text = "Membership Expired"
+                    logging.info('Membership Expired')
+                    result_text.style('color: red')
+                    result_text2.style('color: red')       
+                    
+                else:
+                    result_text.text = "❌ Access Denied"
+                    result_text2.text = "Valid Pass Not Foud. Please Purchase at Front Desk"
+                    logging.info('No Pass Found')
+                    result_text.style('color: red')
+                    result_text2.style('color: red')
+        
+
+    barcode_input.value = ""  # Clear field after processing
+    logging.shutdown()
+    timer_task = asyncio.create_task(timer_function())
+    
+def cleanup():
+    global arduino
+    if arduino and arduino.is_open:
+        arduino.close()
+        print("🔌 Arduino serial port closed")
+        logging.info('Arduino serial port closed')
+    else:
+        print(" No cleanup")     
+app.on_shutdown(cleanup)
+
+# --- Trigger Logic on Enter Key ---
+barcode_input.on('keydown', lambda e: asyncio.create_task(process_barcode()) if e.args['key'] == 'Enter' else None)
+
+# --- Run the App ---
+ui.run(native=True, reload=False, title="Arena Badminton Gate Controller")
